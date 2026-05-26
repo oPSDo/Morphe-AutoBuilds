@@ -1,4 +1,4 @@
-name: Manual Patch and Update
+name: Auto Build and Release Morphe
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -6,226 +6,450 @@ env:
 on:
   workflow_dispatch:
     inputs:
-      app_name:
-        description: 'App name (from apps/ folder)'
-        required: true
-        type: string
-        default: 'youtube'
-      source:
-        description: 'Source name (from sources/ folder)'
-        required: true
-        type: string
-        default: 'revanced'
-      version:
-        description: 'Specific version (leave empty for latest)'
-        required: false
-        type: string
-        default: ''
-      architecture:
-        description: 'Architecture to build'
-        required: false
-        type: choice
-        options:
-          - arm64-v8a
-          - armeabi-v7a
-          - universal
-        default: 'universal'
-      replace_in_release:
-        description: 'Replace APK in existing release'
-        required: true
+      force_full_rebuild:
+        description: "Rebuild every app (ignore incremental check)"
         type: boolean
-        default: true
+        required: false
+        default: false
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
 
 jobs:
-  manual-patch:
+  download-tools:
+    name: Download Morphe Tools
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.cache-key }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4.5.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       
-      - name: Set Specific Version (if provided)
-        if: ${{ inputs.version != '' }}
-        run: |
-          # Update app config with specific version
-          for dir in apps/apkmirror apps/apkpure apps/uptodown; do
-            config_file="$dir/${{ inputs.app_name }}.json"
-            if [ -f "$config_file" ]; then
-              echo "Updating $config_file with version ${{ inputs.version }}"
-              # Update JSON with specific version
-              python -c "
-              import json, sys, os
-              with open('$config_file', 'r') as f:
-                  config = json.load(f)
-              config['version'] = '${{ inputs.version }}'
-              with open('$config_file', 'w') as f:
-                  json.dump(config, f, indent=2)
-              "
-              echo "Updated: $config_file"
-              break
-            fi
-          done
-      
-      - name: Install Python
+      - name: Setup Python
         uses: actions/setup-python@v5.1.0
         with:
           python-version: 3.11
       
+      - name: Download Morphe Tools
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p tools
+          curl -L "https://github.com/revanced/revanced-cli/releases/latest/download/revanced-cli-all.jar" -o tools/revanced-cli.jar
+          curl -L "https://github.com/revanced/revanced-patches/releases/latest/download/patches.jar" -o tools/patches.jar
+          curl -L "https://github.com/revanced/revanced-integrations/releases/latest/download/app-release-unsigned.apk" -o tools/integrations.apk
+      
+      - name: Cache Tools
+        uses: actions/cache@v4.1.0
+        id: cache-tools
+        with:
+          path: tools/
+          key: revanced-tools-${{ hashFiles('patch-config.json', 'arch-config.json') }}
+      
+      - name: Generate Cache Key
+        id: cache-key
+        run: echo "cache-key=${{ steps.cache-tools.outputs.cache-key || 'no-cache' }}" >> $GITHUB_OUTPUT
+
+  check-updates:
+    name: Check for Updates
+    needs: download-tools
+    runs-on: ubuntu-latest
+    outputs:
+      has_updates: ${{ steps.check.outputs.has_updates }}
+      build_matrix: ${{ steps.check.outputs.build_matrix }}
+      update_count: ${{ steps.check.outputs.update_count }}
+      total_count: ${{ steps.check.outputs.total_count }}
+      carry_count: ${{ steps.check.outputs.carry_count }}
+      incremental: ${{ steps.check.outputs.incremental }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4.5.0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5.1.0
+        with:
+          python-version: '3.11'
+
+      - name: Validate GitHub Auth
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/validate_github_auth.py
+
       - name: Install Dependencies
         run: |
           pip install -r requirements.txt
           pip install requests beautifulsoup4
-      
-      - name: Build APK
+
+      - name: Run Incremental Update Check
+        id: check
         env:
-          APP_NAME: ${{ inputs.app_name }}
-          SOURCE: ${{ inputs.source }}
-          ARCH: ${{ inputs.architecture }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_FULL_REBUILD: ${{ inputs.force_full_rebuild || 'false' }}
         run: |
-          echo "🔧 Building ${{ inputs.app_name }} with ${{ inputs.source }} for ${{ inputs.architecture }} architecture..."
-          python -m src
-      
-      - name: Find Built APK
-        id: find-apk
+          python scripts/check_app_updates.py
+
+      - name: Show Plan Summary
         run: |
-          # Find the built APK file(s)
-          apk_files=$(ls -1 *.apk 2>/dev/null)
-          if [ -z "$apk_files" ]; then
-            echo "❌ No APK files found"
-            exit 1
-          fi
-          
-          # Fix for multi-line output in GitHub Actions
-          {
-            echo "apk_files<<EOF"
-            echo "$apk_files"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          
-          echo "apk_count=$(echo "$apk_files" | wc -l)" >> "$GITHUB_OUTPUT"
-          
-          # Print for debugging
-          echo "Found these APKs:"
-          echo "$apk_files"
-      
-      - name: Upload as Artifact
+          echo "Total entries:   ${{ steps.check.outputs.total_count }}"
+          echo "Need rebuild:    ${{ steps.check.outputs.update_count }}"
+          echo "Carry over:      ${{ steps.check.outputs.carry_count }}"
+          echo "Incremental:     ${{ steps.check.outputs.incremental }}"
+
+      - name: Upload Plan Artifacts
         uses: actions/upload-artifact@v4.6.0
         with:
-          name: manual-apk-${{ inputs.app_name }}-${{ inputs.architecture }}
+          name: build-plan
+          path: |
+            build_matrix.json
+            carry_over.json
+            new_manifest.json
+          if-no-files-found: warn
+          retention-days: 1
+
+  patch-apps:
+    name: Read Configuration
+    needs: [check-updates, download-tools]
+    runs-on: ubuntu-latest
+    if: needs.check-updates.outputs.has_updates == 'true'
+    outputs:
+      matrix: ${{ steps.read-matrix.outputs.matrix }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4.5.0
+
+      - name: Use Build Matrix from Check
+        id: read-matrix
+        run: |
+          MATRIX='${{ needs.check-updates.outputs.build_matrix }}'
+          if [ -z "$MATRIX" ] || [ "$MATRIX" = "null" ]; then
+            echo "Empty matrix from check; falling back to full patch-config.json"
+            MATRIX=$(jq -c '.patch_list' patch-config.json)
+          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $MATRIX" | head -c 1000
+
+  build-apps:
+    name: Build Applications
+    needs: patch-apps
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.patch-apps.outputs.matrix) }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4.5.0
+
+      - name: Restore Cached Tools
+        uses: actions/cache@v4.1.0
+        with:
+          path: tools/
+          key: revanced-tools-${{ hashFiles('patch-config.json', 'arch-config.json') }}
+
+      - name: Install Python
+        uses: actions/setup-python@v5.1.0
+        with:
+          python-version: 3.11
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install requests beautifulsoup4
+
+      - name: Build APK
+        env:
+          APP_NAME: ${{ matrix.app_name }}
+          SOURCE: ${{ matrix.source }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Building ${{ matrix.app_name }} with ${{ matrix.source }}..."
+          sleep $((RANDOM % 30)).$((RANDOM % 100))
+          
+          python -m src
+
+      - name: Record Build Outputs
+        if: always()
+        env:
+          APP_NAME: ${{ matrix.app_name }}
+          SOURCE: ${{ matrix.source }}
+        run: |
+          mkdir -p build_records
+          # Record every produced APK so manifest can map (app, source, arch) -> filename
+          for apk in *.apk; do
+            [ -e "$apk" ] || continue
+            # record_build.py now detects arch from filename automatically
+            APK_PATH="$apk" python scripts/record_build.py || true
+          done
+          echo "Records produced:"
+          ls -la build_records/ 2>/dev/null || echo "(no records)"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4.6.0
+        with:
+          name: apk-${{ matrix.app_name }}-${{ matrix.source }}
           path: "*.apk"
+
+      - name: Upload Build Records
+        if: always()
+        uses: actions/upload-artifact@v4.6.0
+        with:
+          name: build-records-${{ matrix.app_name }}-${{ matrix.source }}
+          path: build_records/
+          if-no-files-found: ignore
+
+  create-single-release:
+    name: Create Single Release
+    needs: [check-updates, build-apps]
+    runs-on: ubuntu-latest
+    if: always() && needs.check-updates.outputs.has_updates == 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4.5.0
+
+      - name: Download Build Plan
+        uses: actions/download-artifact@v4.1.0
+        with:
+          name: build-plan
+          path: ./build-plan
+        continue-on-error: true
+
+      - name: Download All APK Artifacts
+        uses: actions/download-artifact@v4.1.0
+        with:
+          path: ./all-apks
+          pattern: apk-*
+          if-no-files-found: warn
+
+      - name: Download All Build Records
+        uses: actions/download-artifact@v4.1.0
+        with:
+          path: ./all-records
+          pattern: build-records-*
+        continue-on-error: true
+
+      - name: Check if Any APKs Were Built
+        id: check-apks
+        run: |
+          built_count=$(find ./all-apks -name "*.apk" 2>/dev/null | wc -l)
+          echo "Built APKs: $built_count"
+
+          if [ "$built_count" -eq 0 ]; then
+            echo "❌ No rebuilt APKs available"
+            echo "skip_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ $built_count rebuilt APK(s) ready for release"
+            echo "skip_release=false" >> $GITHUB_OUTPUT
+          fi
       
+      - name: Collect All APKs
+        if: steps.check-apks.outputs.skip_release == 'false'
+        run: |
+          mkdir -p ./release-apks
+          echo "📦 Collecting rebuilt APKs..."
+          find ./all-apks -name "*.apk" -exec cp -f {} ./release-apks/ \; 2>/dev/null || true
+
+          echo "📁 APKs ready for release:"
+          ls -la ./release-apks/
+
+          final_count=$(ls -1 ./release-apks/*.apk 2>/dev/null | wc -l || echo "0")
+          echo "📊 Total APKs: $final_count"
+
+      - name: Build Final Manifest
+        if: steps.check-apks.outputs.skip_release == 'false'
+        run: |
+          echo "🧾 Building manifest.json from build-plan + build records..."
+          # The new_manifest.json (post-plan baseline) lives in the build-plan artifact
+          if [ -f ./build-plan/new_manifest.json ]; then
+            cp ./build-plan/new_manifest.json ./new_manifest.json
+          fi
+          # Flatten all per-build records into one directory
+          mkdir -p build_records
+          if [ -d ./all-records ]; then
+            find ./all-records -name "*.json" -exec cp {} build_records/ \; 2>/dev/null || true
+          fi
+          python scripts/merge_manifest.py || {
+            echo "⚠️ merge_manifest.py failed; continuing without manifest update."
+            rm -f manifest.json
+          }
+          if [ -f manifest.json ]; then
+            echo "✅ manifest.json built:"
+            jq '.entries | length' manifest.json || true
+            cp manifest.json ./release-apks/manifest.json
+          fi
+
+      - name: Validate GitHub Auth
+        if: steps.check-apks.outputs.skip_release == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/validate_github_auth.py
+
       - name: Check Existing Release
-        if: ${{ inputs.replace_in_release == true }}
+        if: steps.check-apks.outputs.skip_release == 'false'
         id: check-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view latest >/dev/null 2>&1; then
-            echo "✅ Release 'latest' exists"
-            echo "release_exists=true" >> $GITHUB_OUTPUT
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Release 'latest' exists; assets will be updated in place."
           else
-            echo "❌ Release 'latest' does not exist"
-            echo "release_exists=false" >> $GITHUB_OUTPUT
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            echo "📭 Release 'latest' does not exist; it will be created."
           fi
       
-      - name: Update Release
-        if: ${{ inputs.replace_in_release == true }}
+      - name: Generate Release Notes
+        if: steps.check-apks.outputs.skip_release == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🔄 Updating release efficiently..."
-          
-          # 1. GENERATE FILE LIST FOR NOTES
-          # We fetch the list of names via API so the release notes remain accurate
-          # without needing to download the actual heavy APK files.
-          if [ "${{ steps.check-release.outputs.release_exists }}" == "true" ]; then
+          echo "📝 Generating release notes..."
+
+          if [ "${{ steps.check-release.outputs.release_exists }}" = "true" ]; then
             gh release view latest --json assets --jq '.assets[].name' > current_assets.txt
           else
-            touch current_assets.txt
+            : > current_assets.txt
           fi
-          
-          # Add the new APK name(s) to the text file
-          for apk in *.apk; do
-            echo "$apk" >> current_assets.txt
+
+          for apk in ./release-apks/*.apk; do
+            [ -f "$apk" ] || continue
+            basename "$apk" >> current_assets.txt
           done
-          
-          # 2. CREATE RELEASE NOTES
-          cat > release_notes.md << EOF
-          # Morphe APKs
+
+          if [ -f ./release-apks/manifest.json ]; then
+            echo "manifest.json" >> current_assets.txt
+          fi
+
+          sort -u current_assets.txt > release_assets.txt
+
+          cat > release_notes.md << 'EOF'
+          # Morphe APKs - Auto Built
           
           ## 📱 Available Apps
+          
           EOF
-          
-          # Sort and use 'unique' to remove duplicates in the text list
-          sort -u current_assets.txt | while read filename; do
+
+          while read -r filename; do
+            [ -n "$filename" ] || continue
             echo "- $filename" >> release_notes.md
-          done
-          
-          cat >> release_notes.md << EOF
-          
+          done < release_assets.txt
+
+          cat >> release_notes.md << 'EOF'
           ---
           
-          **Last Update:** $(date)
-          **Updated App:** ${{ inputs.app_name }}
-          **Architecture:** ${{ inputs.architecture }}
-          **Source:** ${{ inputs.source }}
+          ## ⚙️ Build Information
+          - **Auto-built daily at 6 AM UTC**
+          - **Multiple architecture support** (arm64-v8a, armeabi-v7a, universal)
+          - **Latest Morphe patches**
+          - **Updated automatically**
           
-          Auto-updates daily at 6 AM UTC.
+          ## 📊 Architecture Guide
+          - **arm64-v8a**: Modern ARM devices (2014+)
+          - **armeabi-v7a**: Older ARM devices
+          - **universal**: All ARM devices (larger file)
+          
+          ## ⚠️ Disclaimer
+          These APKs are built automatically. Use at your own risk.
+          
+          ## 🔄 Update Schedule
+          - Automatic updates daily at 6 AM UTC
+          - Manual updates available via workflow dispatch
+          - Creates `latest` if missing and uploads rebuilt assets in place
           EOF
-          
-          # 3. PERFORM UPDATE (CLOBBER) OR CREATE
-          if [ "${{ steps.check-release.outputs.release_exists }}" == "true" ]; then
-            echo "⬆️ Uploading new assets (clobbering existing)..."
-            # --clobber overwrites the file if it exists, adds it if it doesn't
-            gh release upload latest *.apk --clobber
+      
+      - name: Upload Or Create Release
+        if: steps.check-apks.outputs.skip_release == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🚀 Publishing rebuilt assets to release..."
+
+          # Count APKs
+          apk_count=$(ls -1 ./release-apks/*.apk 2>/dev/null | wc -l || echo "0")
+
+          if [ $apk_count -eq 0 ]; then
+            echo "❌ No APKs found to release"
+            exit 1
+          fi
+
+          echo "📦 Releasing $apk_count APK(s)..."
+
+          # Build the asset list: APKs + optional manifest.json
+          ASSETS=( ./release-apks/*.apk )
+          if [ -f ./release-apks/manifest.json ]; then
+            ASSETS+=( ./release-apks/manifest.json )
+            echo "📎 Including manifest.json"
+          fi
+
+          if [ "${{ steps.check-release.outputs.release_exists }}" = "true" ]; then
+            echo "⬆️ Uploading rebuilt assets in place and refreshing release metadata..."
             
-            echo "📝 Updating release title and notes..."
+            # Delete old APK versions that are being replaced
+            for apk in "${ASSETS[@]}"; do
+              if [[ "$apk" == *.apk ]]; then
+                filename=$(basename "$apk")
+                echo "🗑️ Deleting old version of $filename from latest release..."
+                gh release delete latest "$filename" --yes || true
+              fi
+            done
+            
+            # Upload new APKs and manifest
+            gh release upload latest "${ASSETS[@]}" --clobber
             gh release edit latest \
               --title "Morphe APKs - $(date +'%Y-%m-%d %H:%M')" \
               --notes-file release_notes.md
-              
           else
-            echo "🚀 Creating new release..."
+            echo "🆕 Creating 'latest' release..."
             gh release create "latest" \
               --title "Morphe APKs - $(date +'%Y-%m-%d %H:%M')" \
               --notes-file release_notes.md \
-              *.apk \
+              "${ASSETS[@]}" \
               --latest
           fi
-          
-          echo "✅ Release updated successfully!"
+
+          echo "✅ Release publish step completed successfully!"
       
-      - name: Show Download Links
-        if: ${{ inputs.replace_in_release == true }}
+      - name: Display Release URL
+        if: steps.check-apks.outputs.skip_release == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           release_url=$(gh release view latest --json url --jq .url)
-          echo "🔗 Updated Release URL: $release_url"
+          echo "🔗 Release URL: $release_url"
           echo ""
-          echo "📦 Direct APK links:"
-          for apk in *.apk; do
-            echo "  - $release_url/download/$apk"
+          echo "📦 Direct Download Links:"
+          for apk in ./release-apks/*.apk; do
+            filename=$(basename "$apk")
+            echo "- $filename: $release_url/download/$filename"
           done
-      
-      - name: Cleanup Version Override
-        if: ${{ inputs.version != '' && always() }}
-        run: |
-          # Reset version to empty in configs
-          for dir in apps/apkmirror apps/apkpure apps/uptodown; do
-            config_file="$dir/${{ inputs.app_name }}.json"
-            if [ -f "$config_file" ]; then
-              echo "Resetting version in $config_file"
-              python -c "
-              import json, sys, os
-              with open('$config_file', 'r') as f:
-                  config = json.load(f)
-              config['version'] = ''
-              with open('$config_file', 'w') as f:
-                  json.dump(config, f, indent=2)
-              "
-            fi
-          done
+
+  cleanup:
+    name: Cleanup Workflow Runs
+    needs: [build-apps, create-single-release]
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      actions: write
+    steps:
+      - name: Delete Old Workflow Runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          retain_days: 3
+          keep_minimum_runs: 5
