@@ -93,7 +93,7 @@ def find_apksigner() -> str | None:
 
     if not build_tools_dir.exists():
         logging.error(f"No build-tools found at: {build_tools_dir}")
-        return None
+        return []
 
     versions = sorted(build_tools_dir.iterdir(), reverse=True)
     for version_dir in versions:
@@ -134,17 +134,21 @@ def run_process(
         process.stdout.close()
         return_code = process.wait()
 
+        output = ''.join(output_lines).strip() if capture else None
+
         if check and return_code != 0:
-            raise subprocess.CalledProcessError(return_code, command)
+            # Include captured output so callers can diagnose and optionally retry.
+            raise subprocess.CalledProcessError(return_code, command, output=output)
 
-        return ''.join(output_lines).strip() if capture else None
+        return output
 
-    except FileNotFoundError:
-        print(f"Command not found: {command[0]}", flush=True)
-        exit(1)
+    except FileNotFoundError as e:
+        # Let callers handle this (e.g., fallback to another tool).
+        raise e
     except Exception as e:
-        print(f"Error while running command: {e}", flush=True)
-        exit(1)
+        # Do not exit() here; callers (workflow) may want to retry with a different
+        # version/source or emit a clearer error message.
+        raise e
 
 def normalize_version(version: str) -> list[int]:
     parts = version.split('.')
@@ -177,13 +181,19 @@ def get_highest_version(versions: list[str]) -> str | None:
             highest_version = v
     return highest_version
 
-def get_supported_version(package_name: str, cli: str, patches: str) -> Optional[str]:
+def get_supported_versions(package_name: str, cli: str, patches: str) -> list[str]:
     # Morphe CLI and ReVanced CLI have different list-versions syntax
     cli_name = Path(cli).name.lower()
     is_morphe_cli = 'morphe' in cli_name
     is_revanced_v6_or_newer = 'revanced-cli-6' in cli_name or 'revanced-cli-7' in cli_name or 'revanced-cli-8' in cli_name
 
     if is_morphe_cli:
+        # Morphe CLI docs officially describe `list-patches --with-packages --with-versions`
+        # (and the output tends to include more complete version information than
+        # `list-versions`, which may only show "most common" compatible versions).
+        #
+        # We still try `list-versions` first because it's lighter, but if it
+        # yields too little info we fall back to parsing `list-patches`.
         cmd = [
             'java', '-jar', cli,
             'list-versions',
@@ -206,11 +216,13 @@ def get_supported_version(package_name: str, cli: str, patches: str) -> Optional
             patches
         ]
 
+    # We want the raw output even if the CLI returns a non-zero exit code (bad
+    # args, missing patches, etc.) so we can decide what to do.
     output = run_process(cmd, capture=True, silent=True, check=False)
 
     if not output:
         logging.warning("No output returned from list-versions command")
-        return None
+        return []
 
     lines = output.splitlines()
     logging.info(f"CLI raw output lines: {lines}")
@@ -219,11 +231,11 @@ def get_supported_version(package_name: str, cli: str, patches: str) -> Optional
     first_line = lines[0].strip().lower()
     if 'usage:' in first_line or 'unmatched argument' in first_line or 'error' in first_line:
         logging.warning(f"CLI returned error/usage output, cannot determine version")
-        return None
+        return []
 
     if len(lines) <= 2:
         logging.warning("Output has no version lines")
-        return None
+        return []
 
     versions = []
     for line in lines[2:]:
@@ -242,12 +254,44 @@ def get_supported_version(package_name: str, cli: str, patches: str) -> Optional
                     version = f"{parts[0]} build {parts[2]}"
                 versions.append(version)
 
+    # If Morphe CLI only returned a tiny "most common" list (or nothing),
+    # attempt to derive a fuller candidate set from `list-patches`.
+    if is_morphe_cli and len(versions) <= 1:
+        try:
+            alt_cmd = [
+                "java", "-jar", cli,
+                "list-patches",
+                "--with-packages",
+                "--with-versions",
+                patches,
+            ]
+            alt_out = run_process(alt_cmd, capture=True, silent=True, check=False) or ""
+            derived: list[str] = []
+            for ln in alt_out.splitlines():
+                if package_name not in ln:
+                    continue
+                # Grab any versions mentioned on the same line as the package name.
+                for m in re.finditer(r"\d+(?:\.\d+)+(?:\(\d+\))?", ln):
+                    derived.append(m.group(0))
+            if derived:
+                versions.extend(derived)
+        except Exception:
+            pass
+
     if not versions:
         logging.warning("No supported versions found")
-        return None
+        return []
 
+    # Sort highest -> lowest.
+    versions = sorted(set(versions), key=normalize_version, reverse=True)
     logging.info(f"CLI parsed versions: {versions}")
-    return get_highest_version(versions)
+    return versions
+
+
+def get_supported_version(package_name: str, cli: str, patches: str) -> Optional[str]:
+    """Backwards compatible helper: returns the highest compatible version, if any."""
+    versions = get_supported_versions(package_name, cli, patches)
+    return versions[0] if versions else None
 
 def extract_filename(response, fallback_url=None) -> str:
     cd = response.headers.get('content-disposition')
