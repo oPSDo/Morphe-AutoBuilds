@@ -1,7 +1,6 @@
 {
     "org": "instagram",
     "name": "instagram-instagram",
-    "release_prefix": "instagram-instagram",
     "type": "BUNDLE", 
     "arch": "arm64-v8a",
     "dpi": "120-640dpi",
