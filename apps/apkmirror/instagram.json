@@ -3,7 +3,7 @@
     "name": "instagram-instagram",
     "type": "BUNDLE", 
     "arch": "arm64-v8a",
-    "dpi": "120-640dpi",
+    "dpi": "480-640dpi",
     "package" : "com.instagram.android",
     "version" : ""
 }
